@@ -1,25 +1,33 @@
-import requests, base64, json, socket
+import requests, base64, json
 
-def is_online(host, port):
-    try:
-        with socket.create_connection((host, int(port)), timeout=2): return True
-    except: return False
-
-def get_5_us():
+def get_5_us_vmess():
     working = []
-    # Source link from OpenProxyList
-    r = requests.get("https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt")
-    for line in r.text.splitlines():
-        if len(working) >= 5: break
-        if "vmess://" in line and any(tag in line for tag in ["US", "United States", "🇺🇸"]):
-            try:
-                # Basic check to see if server responds
-                config = json.loads(base64.b64decode(line.split("vmess://")[1] + '===').decode('utf-8'))
-                if is_online(config['add'], config['port']):
-                    working.append(line)
-            except: continue
-    return base64.b64encode("\n".join(working).encode('utf-8')).decode('utf-8')
+    # Using the raw GitHub source of OpenProxyList for better reliability
+    url = "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt"
+    
+    try:
+        r = requests.get(url, timeout=15)
+        lines = r.text.splitlines()
+        
+        for line in lines:
+            if len(working) >= 5: break
+            
+            # 1. Must be vmess
+            # 2. Must contain US or United States or the US Flag
+            if line.startswith("vmess://") and any(x in line for x in ["US", "United States", "🇺🇸"]):
+                working.append(line)
+                
+    except Exception as e:
+        print(f"Error: {e}")
+        
+    if not working:
+        return ""
+        
+    # Join the 5 links with newlines and encode to Base64
+    combined = "\n".join(working)
+    return base64.b64encode(combined.encode('utf-8')).decode('utf-8')
 
+# Save to sub.txt
+output = get_5_us_vmess()
 with open("sub.txt", "w") as f:
-    f.write(get_5_us())
-  
+    f.write(output)
