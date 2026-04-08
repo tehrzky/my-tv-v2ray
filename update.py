@@ -1,39 +1,33 @@
 import requests, base64
 
 def get_5_us_vmess():
-    # These are MIRRORS that GitHub doesn't block
-    sources = [
-        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt", # Mirror of openproxylist
-        "https://raw.githubusercontent.com/vfarid/v2ray-share/main/all_links.txt",
-        "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Splitted-By-Protocol/vmess.txt"
-    ]
-    
+    url = "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt"
     working = []
-    us_markers = ["UNITED STATES", "USA", "US-", "🇺🇸"]
-
-    for url in sources:
-        try:
-            # We don't need fancy headers for GitHub-to-GitHub links
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                for line in r.text.splitlines():
-                    if len(working) >= 10: break
-                    line = line.strip()
-                    if line.startswith("vmess://") and any(m in line.upper() for m in us_markers):
-                        working.append(line)
-        except: continue
-            
-    if not working: return ""
     
-    # Standard V2Ray Base64 encoding
-    combined = "\n".join(working) + "\n"
-    encoded = base64.b64encode(combined.encode('utf-8')).decode('utf-8')
+    try:
+        r = requests.get(url, timeout=15)
+        lines = r.text.splitlines()
+        
+        for line in lines:
+            if len(working) >= 5: break
+            # Search for VMess + US tags
+            if "vmess://" in line and any(tag in line.upper() for tag in ["US", "UNITED STATES", "🇺🇸"]):
+                working.append(line.strip())
+                    
+    except:
+        pass
+        
+    if not working:
+        return ""
+        
+    # Standard V2Ray subscription format: links separated by newlines
+    combined_text = "\n".join(working)
     
-    # Fix Padding for your TV
-    while len(encoded) % 4 != 0: encoded += "="
-    return encoded
+    # Standard Base64 encoding
+    encoded_bytes = base64.b64encode(combined_text.encode('utf-8'))
+    return encoded_bytes.decode('utf-8')
 
-# Save result
+# Save the result
 result = get_5_us_vmess()
 with open("sub.txt", "w") as f:
     f.write(result)
