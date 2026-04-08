@@ -1,49 +1,39 @@
 import requests, base64
 
-def get_from_openproxy():
-    # The direct link you provided
-    url = "https://openproxylist.com/v2ray/rawlist/text"
-    
-    # This "Header" makes the script look like a real Chrome browser
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
+def get_5_us_vmess():
+    # These are MIRRORS that GitHub doesn't block
+    sources = [
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt", # Mirror of openproxylist
+        "https://raw.githubusercontent.com/vfarid/v2ray-share/main/all_links.txt",
+        "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Splitted-By-Protocol/vmess.txt"
+    ]
     
     working = []
-    # We only want US servers
     us_markers = ["UNITED STATES", "USA", "US-", "🇺🇸"]
 
-    try:
-        # We add 'headers=headers' here to bypass the bot blocker
-        r = requests.get(url, headers=headers, timeout=15)
-        
-        if r.status_code == 200:
-            lines = r.text.splitlines()
-            for line in lines:
-                if len(working) >= 10: break # Grab up to 10
-                
-                if "vmess://" in line:
-                    # Check for US markers
-                    if any(m in line.upper() for m in us_markers):
-                        working.append(line.strip())
-        else:
-            print(f"Site blocked us. Status code: {r.status_code}")
+    for url in sources:
+        try:
+            # We don't need fancy headers for GitHub-to-GitHub links
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                for line in r.text.splitlines():
+                    if len(working) >= 10: break
+                    line = line.strip()
+                    if line.startswith("vmess://") and any(m in line.upper() for m in us_markers):
+                        working.append(line)
+        except: continue
             
-    except Exception as e:
-        print(f"Error: {e}")
-
-    if not working:
-        return ""
-
-    # Encode for your V2Ray app
+    if not working: return ""
+    
+    # Standard V2Ray Base64 encoding
     combined = "\n".join(working) + "\n"
     encoded = base64.b64encode(combined.encode('utf-8')).decode('utf-8')
     
-    # Fix Padding
+    # Fix Padding for your TV
     while len(encoded) % 4 != 0: encoded += "="
     return encoded
 
 # Save result
-result = get_from_openproxy()
+result = get_5_us_vmess()
 with open("sub.txt", "w") as f:
     f.write(result)
