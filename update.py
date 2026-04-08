@@ -1,7 +1,6 @@
 import requests, base64
 
 def get_5_us_vmess():
-    # Source link
     url = "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt"
     working = []
     
@@ -10,23 +9,23 @@ def get_5_us_vmess():
         lines = r.text.splitlines()
         
         for line in lines:
-            if len(working) >= 5:
-                break
-            
-            # This looks for US, United States, or the US Flag emoji anywhere in the link
-            if "vmess://" in line:
-                if any(target in line.upper() for target in ["US", "UNITED STATES", "🇺🇸"]):
-                    working.append(line.strip())
+            if len(working) >= 5: break
+            # Search for VMess + US tags
+            if "vmess://" in line and any(tag in line.upper() for tag in ["US", "UNITED STATES", "🇺🇸"]):
+                working.append(line.strip())
                     
-    except Exception as e:
-        print(f"Error: {e}")
+    except:
+        pass
         
     if not working:
         return ""
         
-    # Join with newlines and encode
+    # Standard V2Ray subscription format: links separated by newlines
     combined_text = "\n".join(working)
-    return base64.b64encode(combined_text.encode('utf-8')).decode('utf-8')
+    
+    # Standard Base64 encoding
+    encoded_bytes = base64.b64encode(combined_text.encode('utf-8'))
+    return encoded_bytes.decode('utf-8')
 
 # Save the result
 result = get_5_us_vmess()
