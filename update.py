@@ -1,53 +1,49 @@
 import requests, base64
 
-def get_5_us_vmess():
-    # Adding fresh 2026 sources
-    sources = [
-        "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/super-sub.txt",
-        "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Splitted-By-Protocol/vmess.txt",
-        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt"
-    ]
+def get_from_openproxy():
+    # The direct link you provided
+    url = "https://openproxylist.com/v2ray/rawlist/text"
     
-    found_us = []
-    backup_all = []
-    us_keywords = ["UNITED STATES", "USA", "US-", "NEW YORK", "LOS ANGELES", "CHICAGO", "🇺🇸"]
+    # This "Header" makes the script look like a real Chrome browser
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
+    working = []
+    # We only want US servers
+    us_markers = ["UNITED STATES", "USA", "US-", "🇺🇸"]
 
-    for url in sources:
-        try:
-            r = requests.get(url, timeout=10)
-            # Some sources are already Base64, we need to decode them first
-            content = r.text
-            try:
-                content = base64.b64decode(content).decode('utf-8')
-            except:
-                pass # It was already plain text
+    try:
+        # We add 'headers=headers' here to bypass the bot blocker
+        r = requests.get(url, headers=headers, timeout=15)
+        
+        if r.status_code == 200:
+            lines = r.text.splitlines()
+            for line in lines:
+                if len(working) >= 10: break # Grab up to 10
                 
-            for line in content.splitlines():
-                line = line.strip()
-                if not line.startswith("vmess://"): continue
-                
-                # Keep everything as a backup
-                if len(backup_all) < 10: backup_all.append(line)
-                
-                # Filter for US
-                if any(k in line.upper() for k in us_keywords):
-                    if len(found_us) < 5: found_us.append(line)
-        except: continue
+                if "vmess://" in line:
+                    # Check for US markers
+                    if any(m in line.upper() for m in us_markers):
+                        working.append(line.strip())
+        else:
+            print(f"Site blocked us. Status code: {r.status_code}")
             
-    # Priority: 1. US Servers, 2. Backup Servers, 3. Empty String
-    final_list = found_us if found_us else backup_all
-    
-    if not final_list: return ""
-    
-    # Standard V2Ray Base64 encoding
-    combined_text = "\n".join(final_list) + "\n"
-    encoded_str = base64.b64encode(combined_text.encode('utf-8')).decode('utf-8')
-    
-    # Ensure correct padding
-    while len(encoded_str) % 4 != 0: encoded_str += "="
-    return encoded_str
+    except Exception as e:
+        print(f"Error: {e}")
 
-# Save
-result = get_5_us_vmess()
+    if not working:
+        return ""
+
+    # Encode for your V2Ray app
+    combined = "\n".join(working) + "\n"
+    encoded = base64.b64encode(combined.encode('utf-8')).decode('utf-8')
+    
+    # Fix Padding
+    while len(encoded) % 4 != 0: encoded += "="
+    return encoded
+
+# Save result
+result = get_from_openproxy()
 with open("sub.txt", "w") as f:
     f.write(result)
