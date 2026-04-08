@@ -9,10 +9,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run Script
         run: python3 update.py
-      - name: Save Results
+            - name: Save Results
         run: |
-          git config --global user.name "Bot"
-          git config --global user.email "bot@github.com"
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
           git add sub.txt
-          git commit -m "Updated" || exit 0
-          git push
+          git commit -m "Auto-update: $(date)" || echo "No changes to commit"
+          git push origin main || git push --force origin main
