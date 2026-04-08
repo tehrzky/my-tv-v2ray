@@ -1,6 +1,6 @@
-import requests, base64
+import requests
 
-def get_5_us_vmess():
+def get_5_us_vmess_plain():
     sources = [
         "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt",
         "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/V2Ray-Config-By-EbraSha-All-Type.txt",
@@ -16,27 +16,15 @@ def get_5_us_vmess():
             for line in r.text.splitlines():
                 if len(working) >= 5: break
                 line = line.strip()
+                # Check for vmess and US markers
                 if line.startswith("vmess://") and any(k in line.upper() for k in us_keywords):
                     working.append(line)
         except: continue
             
-    if not working: return ""
-    
-    # 1. Join with simple newlines
-    combined_text = "\n".join(working)
-    
-    # 2. Encode to Base64
-    encoded_bytes = base64.b64encode(combined_text.encode('utf-8'))
-    encoded_str = encoded_bytes.decode('utf-8')
-    
-    # 3. FIX PADDING (The most important part for TV apps)
-    # Base64 length must be a multiple of 4
-    while len(encoded_str) % 4 != 0:
-        encoded_str += "="
-        
-    return encoded_str
+    # Return the links joined by a new line (NOT encoded)
+    return "\n".join(working)
 
 # Save result
-result = get_5_us_vmess()
+result = get_5_us_vmess_plain()
 with open("sub.txt", "w") as f:
     f.write(result)
