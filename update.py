@@ -1,46 +1,40 @@
-import requests, base64, json
+import requests, base64
 
 def get_5_us_vmess():
-    # Multiple sources to ensure we never get an empty file
     sources = [
         "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt",
         "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/V2Ray-Config-By-EbraSha-All-Type.txt",
-        "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/vmess.txt"
+        "https://raw.githubusercontent.com/vfarid/v2ray-share/main/all_links.txt"
     ]
     
     working = []
-    us_keywords = ["UNITED STATES", "USA", "US-", "NEW YORK", "LOS ANGELES", "CHICAGO", "🇺🇸"]
+    us_keywords = ["UNITED STATES", "USA", "US-", "NEW YORK", "🇺🇸"]
 
     for url in sources:
         try:
             r = requests.get(url, timeout=10)
-            lines = r.text.splitlines()
-            for line in lines:
+            for line in r.text.splitlines():
                 if len(working) >= 5: break
-                
-                # Check for VMess
-                if line.startswith("vmess://"):
-                    # Check if the raw line contains US markers
-                    if any(k in line.upper() for k in us_keywords):
-                        working.append(line.strip())
-                    else:
-                        # Deep check: decode it to see if US is hidden inside
-                        try:
-                            b64_data = line.replace("vmess://", "")
-                            decoded = json.loads(base64.b64decode(b64_data + "==").decode('utf-8'))
-                            ps = str(decoded.get('ps', '')).upper()
-                            if any(k in ps for k in us_keywords):
-                                working.append(line.strip())
-                        except:
-                            continue
-        except:
-            continue
+                line = line.strip()
+                if line.startswith("vmess://") and any(k in line.upper() for k in us_keywords):
+                    working.append(line)
+        except: continue
             
-    if not working:
-        return ""
+    if not working: return ""
     
-    # Return as Base64 for your TV app
-    return base64.b64encode("\n".join(working).encode('utf-8')).decode('utf-8')
+    # 1. Join with simple newlines
+    combined_text = "\n".join(working)
+    
+    # 2. Encode to Base64
+    encoded_bytes = base64.b64encode(combined_text.encode('utf-8'))
+    encoded_str = encoded_bytes.decode('utf-8')
+    
+    # 3. FIX PADDING (The most important part for TV apps)
+    # Base64 length must be a multiple of 4
+    while len(encoded_str) % 4 != 0:
+        encoded_str += "="
+        
+    return encoded_str
 
 # Save result
 result = get_5_us_vmess()
