@@ -1,7 +1,7 @@
 name: DailyUpdate
 on:
   schedule:
-    - cron: '0 0 * * *' # Runs every day at midnight
+    - cron: '0 */4 * * *' # Runs every 4hrs
   workflow_dispatch: # Allows you to run it manually
 
 jobs:
