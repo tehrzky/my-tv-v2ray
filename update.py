@@ -1,8 +1,11 @@
-import requests, base64
+import requests, base64, json
 
-def get_5_us_vmess():
+def get_5_strict_us():
     url = "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt"
     working = []
+    
+    # These are the only markers we will accept
+    us_markers = ["UNITED STATES", "US-", " US ", "🇺🇸", "NEW YORK", "LOS ANGELES", "CHICAGO", "WASHINGTON"]
     
     try:
         r = requests.get(url, timeout=15)
@@ -10,24 +13,25 @@ def get_5_us_vmess():
         
         for line in lines:
             if len(working) >= 5: break
-            # Search for VMess + US tags
-            if "vmess://" in line and any(tag in line.upper() for tag in ["US", "UNITED STATES", "🇺🇸"]):
-                working.append(line.strip())
+            
+            if "vmess://" in line:
+                # Convert line to uppercase to make matching easier
+                upper_line = line.upper()
+                
+                # Check if any US marker is in the line
+                if any(marker in upper_line for marker in us_markers):
+                    # Double check: ignore common false positives
+                    if "RUSSIA" not in upper_line and "BELARUS" not in upper_line:
+                        working.append(line.strip())
                     
     except:
         pass
         
-    if not working:
-        return ""
-        
-    # Standard V2Ray subscription format: links separated by newlines
-    combined_text = "\n".join(working)
+    if not working: return ""
     
-    # Standard Base64 encoding
-    encoded_bytes = base64.b64encode(combined_text.encode('utf-8'))
-    return encoded_bytes.decode('utf-8')
+    combined_text = "\n".join(working)
+    return base64.b64encode(combined_text.encode('utf-8')).decode('utf-8')
 
-# Save the result
-result = get_5_us_vmess()
+result = get_5_strict_us()
 with open("sub.txt", "w") as f:
     f.write(result)
