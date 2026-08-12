@@ -4,8 +4,8 @@ import json
 import re
 import socket
 import logging
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
 from collections import OrderedDict
 
 logging.basicConfig(
@@ -15,18 +15,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────
-SOURCE_URL = "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt"
+SOURCES = [
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt",
+    "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vmess.txt",
+]
 OUTPUT_FILE = "sub.txt"
+MAX_RESULTS = 20
 MAX_WORKERS = 32
 REQUEST_TIMEOUT = 15
 GEO_TIMEOUT = 20
 
-# Expanded US indicators in remarks (ps field)
+# Expanded US indicators
 US_REMARK_PATTERNS = re.compile(
     r"\b(US|USA|UNITED[ _-]?STATES|AMERICA|AMERICAN|"
     r"LAX|SFO|SEA|NYC|CHI|MIA|DAL|ATL|PHX|DEN|BOS|"
     r"CALIFORNIA|TEXAS|NEW[ _-]?YORK|FLORIDA|VIRGINIA|"
-    r"VERMONT|OREGON|OHIO|NEVADA|NEVADA|"
+    r"VERMONT|OREGON|OHIO|NEVADA|"
     r"🇺🇸|U\.S\.A?)\b",
     re.IGNORECASE
 )
@@ -34,32 +38,85 @@ US_REMARK_PATTERNS = re.compile(
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def decode_vmess(line: str) -> dict | None:
-    """Robustly decode a vmess:// URL to its JSON config."""
+    """Decode vmess:// URL to JSON config. Handles both base64-JSON and URI formats."""
     if not line.startswith("vmess://"):
         return None
-    b64_part = line[8:]  # strip "vmess://"
+    payload = line[8:]
+
+    # ── Try base64 JSON first ─────────────────────────────────────────────
     try:
-        # Proper padding handling
-        pad = 4 - len(b64_part) % 4
+        pad = 4 - len(payload) % 4
         if pad != 4:
-            b64_part += "=" * pad
-        decoded = base64.urlsafe_b64decode(b64_part).decode("utf-8")
-        return json.loads(decoded)
+            payload += "=" * pad
+        decoded = base64.urlsafe_b64decode(payload).decode("utf-8")
+        cfg = json.loads(decoded)
+        if cfg.get("add") and cfg.get("port"):
+            return cfg
+    except Exception:
+        pass
+
+    # ── Try URI format: vmess://uuid@host:port?params#remark ──────────────
+    try:
+        # Split fragment (remark/ps)
+        if "#" in payload:
+            body, remark = payload.split("#", 1)
+            remark = urllib.parse.unquote(remark)
+        else:
+            body, remark = payload, ""
+
+        # Parse userinfo@host:port
+        if "@" not in body:
+            return None
+        userinfo, hostport = body.rsplit("@", 1)
+        uuid = urllib.parse.unquote(userinfo)
+
+        # Parse host:port
+        if ":" in hostport:
+            host, port_str = hostport.rsplit(":", 1)
+            port = int(port_str)
+        else:
+            host, port = hostport, 443
+
+        # Parse query params
+        if "?" in host:
+            host, query = host.split("?", 1)
+            params = urllib.parse.parse_qs(query)
+        else:
+            params = {}
+
+        net = params.get("type", ["tcp"])[0]
+        tls = params.get("security", [""])[0]
+        path = urllib.parse.unquote(params.get("path", ["/"])[0])
+        host_header = urllib.parse.unquote(params.get("host", [""])[0])
+        sni = urllib.parse.unquote(params.get("sni", [""])[0])
+
+        return {
+            "v": "2",
+            "ps": remark,
+            "add": host,
+            "port": str(port),
+            "id": uuid,
+            "aid": "0",
+            "scy": "auto",
+            "net": net,
+            "type": "none",
+            "host": host_header,
+            "path": path,
+            "tls": tls,
+            "sni": sni,
+        }
     except Exception as e:
-        logger.debug(f"Decode failed: {e}")
+        logger.debug(f"URI parse failed: {e}")
         return None
 
 
 def is_us_by_remark(cfg: dict) -> bool:
-    """Check if the proxy name/remarks indicate US."""
     ps = str(cfg.get("ps", ""))
     add = str(cfg.get("add", ""))
     return bool(US_REMARK_PATTERNS.search(ps)) or bool(US_REMARK_PATTERNS.search(add))
 
 
 def resolve_host(host: str) -> str | None:
-    """Resolve domain to IPv4; return IP if already an IP."""
-    # Quick IP check
     if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host):
         return host
     try:
@@ -69,15 +126,9 @@ def resolve_host(host: str) -> str | None:
 
 
 def batch_geolocation(ips: list[str]) -> dict[str, str]:
-    """
-    Query ip-api.com batch endpoint (free, 100 IPs per request).
-    Returns {ip: country_code}.
-    """
     if not ips:
         return {}
-
     results = {}
-    # ip-api free batch limit is 100 per request
     for i in range(0, len(ips), 100):
         batch = ips[i:i+100]
         try:
@@ -94,40 +145,55 @@ def batch_geolocation(ips: list[str]) -> dict[str, str]:
                 if ip:
                     results[ip] = cc
         except Exception as e:
-            logger.warning(f"Batch geolocation failed for chunk {i//100}: {e}")
+            logger.warning(f"Geo batch {i//100} failed: {e}")
     return results
 
 
 def is_valid_cfg(cfg: dict) -> bool:
-    """Ensure the config has the minimum required fields."""
-    required = ("add", "port", "id", "net")
-    return all(cfg.get(k) for k in required)
+    return all(cfg.get(k) for k in ("add", "port", "id", "net"))
+
+
+def fetch_source(url: str) -> list[str]:
+    """Fetch a source and return list of vmess:// lines."""
+    try:
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        text = r.text
+
+        # Some subscriptions wrap the whole file in base64
+        if not text.strip().startswith("vmess://"):
+            try:
+                text = base64.b64decode(text).decode("utf-8")
+            except Exception:
+                pass
+
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("vmess://")]
+        logger.info(f"{url}: {len(lines)} vmess lines")
+        return lines
+    except Exception as e:
+        logger.error(f"Failed to fetch {url}: {e}")
+        return []
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def fetch_and_filter_us_proxies() -> str | None:
-    logger.info(f"Fetching proxy list from {SOURCE_URL}")
-    try:
-        r = requests.get(SOURCE_URL, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch source: {e}")
-        return None
+    # ── 1. Fetch all sources ───────────────────────────────────────────────
+    all_lines = []
+    for url in SOURCES:
+        all_lines.extend(fetch_source(url))
+    logger.info(f"Total vmess lines from all sources: {len(all_lines)}")
 
-    lines = [ln.strip() for ln in r.text.splitlines() if ln.strip().startswith("vmess://")]
-    logger.info(f"Total vmess lines: {len(lines)}")
-
-    # ── 1. Decode & validate ─────────────────────────────────────────────
+    # ── 2. Decode & validate ─────────────────────────────────────────────
     parsed = []
-    for line in lines:
+    for line in all_lines:
         cfg = decode_vmess(line)
         if cfg and is_valid_cfg(cfg):
             parsed.append((line, cfg))
 
     logger.info(f"Valid configs: {len(parsed)}")
 
-    # ── 2. Deduplicate by server:port ────────────────────────────────────
+    # ── 3. Deduplicate by server:port ────────────────────────────────────
     seen = OrderedDict()
     for line, cfg in parsed:
         key = f"{cfg['add']}:{cfg['port']}"
@@ -136,7 +202,7 @@ def fetch_and_filter_us_proxies() -> str | None:
     unique = list(seen.values())
     logger.info(f"Unique server:port combos: {len(unique)}")
 
-    # ── 3. Fast-path: remark-based US filtering ──────────────────────────
+    # ── 4. Fast-path remark filtering ────────────────────────────────────
     remark_us = []
     to_geo_check = []
     for line, cfg in unique:
@@ -147,10 +213,9 @@ def fetch_and_filter_us_proxies() -> str | None:
 
     logger.info(f"US by remarks: {len(remark_us)} | To geo-check: {len(to_geo_check)}")
 
-    # ── 4. Resolve domains → IPs in parallel ─────────────────────────────
+    # ── 5. Resolve domains → IPs in parallel ─────────────────────────────
     host_to_ip = {}
     hosts_to_resolve = list({cfg["add"] for _, cfg in to_geo_check})
-    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         future_to_host = {ex.submit(resolve_host, h): h for h in hosts_to_resolve}
         for future in as_completed(future_to_host):
@@ -159,7 +224,6 @@ def fetch_and_filter_us_proxies() -> str | None:
             if ip:
                 host_to_ip[host] = ip
 
-    # Map configs to their resolved IPs
     ip_mapped = []
     unresolved = 0
     for line, cfg in to_geo_check:
@@ -168,11 +232,10 @@ def fetch_and_filter_us_proxies() -> str | None:
             ip_mapped.append((line, ip))
         else:
             unresolved += 1
-
     if unresolved:
         logger.warning(f"Could not resolve {unresolved} hosts")
 
-    # ── 5. Batch IP geolocation ──────────────────────────────────────────
+    # ── 6. Batch IP geolocation ──────────────────────────────────────────
     unique_ips = list({ip for _, ip in ip_mapped})
     logger.info(f"Querying geolocation for {len(unique_ips)} unique IPs...")
     geo_map = batch_geolocation(unique_ips)
@@ -184,18 +247,22 @@ def fetch_and_filter_us_proxies() -> str | None:
 
     logger.info(f"US by geolocation: {len(geo_us)}")
 
-    # ── 6. Combine & encode ──────────────────────────────────────────────
-    final = remark_us + geo_us
-    if not final:
+    # ── 7. Combine, dedup, and enforce 20-max limit ──────────────────────
+    # Remark-matched entries get priority (more likely intentionally US)
+    combined = list(OrderedDict.fromkeys(remark_us + geo_us))
+    
+    if not combined:
         logger.warning("No US proxies found!")
         return ""
 
-    # Deduplicate one last time (remark + geo might overlap)
-    final_unique = list(OrderedDict.fromkeys(final))
-    logger.info(f"Final US proxy count: {len(final_unique)}")
+    logger.info(f"Total US proxies before limit: {len(combined)}")
+    
+    final = combined[:MAX_RESULTS]
+    logger.info(f"Final US proxy count (max {MAX_RESULTS}): {len(final)}")
 
-    combined = "\n".join(final_unique) + "\n"
-    encoded = base64.b64encode(combined.encode("utf-8")).decode("utf-8")
+    # ── 8. Encode output ─────────────────────────────────────────────────
+    out_text = "\n".join(final) + "\n"
+    encoded = base64.b64encode(out_text.encode("utf-8")).decode("utf-8")
     return encoded
 
 
