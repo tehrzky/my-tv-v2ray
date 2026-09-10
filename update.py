@@ -1,280 +1,305 @@
-import requests
+import asyncio
 import base64
+import ipaddress
 import json
+import logging
 import re
 import socket
-import logging
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+import requests
 
-# ── Configuration ──────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger(__name__)
+
 SOURCES = [
     "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt",
-    "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vmess.txt",
+    "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vless_configs.txt",
 ]
 OUTPUT_FILE = "sub.txt"
 MAX_RESULTS = 20
 MAX_WORKERS = 32
-REQUEST_TIMEOUT = 15
-GEO_TIMEOUT = 20
+REQ_TIMEOUT = 20
+TCP_TIMEOUT = 2.0           # seconds for connect test
+GEO_BATCH = 100
 
-# Expanded US indicators
-US_REMARK_PATTERNS = re.compile(
-    r"\b(US|USA|UNITED[ _-]?STATES|AMERICA|AMERICAN|"
-    r"LAX|SFO|SEA|NYC|CHI|MIA|DAL|ATL|PHX|DEN|BOS|"
-    r"CALIFORNIA|TEXAS|NEW[ _-]?YORK|FLORIDA|VIRGINIA|"
-    r"VERMONT|OREGON|OHIO|NEVADA|"
-    r"🇺🇸|U\.S\.A?)\b",
-    re.IGNORECASE
-)
+# ── Cloudflare / known anycast ranges: geo lies about these ──────────────
+CF_RANGES = [ipaddress.ip_network(n) for n in [
+    "104.16.0.0/13", "104.24.0.0/14", "108.162.192.0/18",
+    "131.0.72.0/22", "141.101.64.0/18", "162.158.0.0/15",
+    "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
+    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
+]]
 
-# ── Helpers ────────────────────────────────────────────────────────────────
-
-def decode_vmess(line: str) -> dict | None:
-    """Decode vmess:// URL to JSON config. Handles both base64-JSON and URI formats."""
-    if not line.startswith("vmess://"):
-        return None
-    payload = line[8:]
-
-    # ── Try base64 JSON first ─────────────────────────────────────────────
+def is_cloudflare(ip: str) -> bool:
     try:
-        pad = 4 - len(payload) % 4
-        if pad != 4:
-            payload += "=" * pad
-        decoded = base64.urlsafe_b64decode(payload).decode("utf-8")
-        cfg = json.loads(decoded)
-        if cfg.get("add") and cfg.get("port"):
-            return cfg
-    except Exception:
-        pass
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a in net for net in CF_RANGES)
 
-    # ── Try URI format: vmess://uuid@host:port?params#remark ──────────────
+# ── Strong US markers ─────────────────────────────────────────────────────
+US_MARKERS = re.compile(
+    r"(🇺🇸|\[US\]|\(US\)|\bUS[-_ ]?\d|\bUSA?\b|UNITED[ _-]?STATES|"
+    r"AMERICA|LAX|SFO|SEA\d|NYC|CHI\d|MIA|DAL|ATL|PHX|DEN|BOS|"
+    r"CALIFORNIA|TEXAS|NEW[ _-]?YORK|FLORIDA|VIRGINIA|VERMONT|"
+    r"OREGON|OHIO|NEVADA)",
+    re.IGNORECASE)
+NEG_MARKERS = re.compile(
+    r"(🇮🇷|🇩🇪|🇫🇷|🇳🇱|🇬🇧|🇹🇷|🇷🇺|🇨🇳|🇭🇰|🇸🇬|🇯🇵|🇰🇷|🇮🇳|"
+    r"\bDE[-_ ]|\bFR[-_ ]|\bNL[-_ ]|\bUK[-_ ]|\bTR[-_ ]|\bRU[-_ ]|"
+    r"\bIR[-_ ]|\bIRAN|GERMANY|FRANCE|NETHERLAND|TURKEY|RUSSIA|IRAN)",
+    re.IGNORECASE)
+
+# ── Parsers ───────────────────────────────────────────────────────────────
+
+def parse_vless(line: str) -> Optional[dict]:
+    """vless://uuid@host:port?query#remark"""
     try:
-        # Split fragment (remark/ps)
-        if "#" in payload:
-            body, remark = payload.split("#", 1)
-            remark = urllib.parse.unquote(remark)
-        else:
-            body, remark = payload, ""
-
-        # Parse userinfo@host:port
+        body = line[8:]
+        fragment = ""
+        if "#" in body:
+            body, fragment = body.split("#", 1)
+            fragment = urllib.parse.unquote(fragment)
         if "@" not in body:
             return None
-        userinfo, hostport = body.rsplit("@", 1)
-        uuid = urllib.parse.unquote(userinfo)
+        uuid, hostport = body.rsplit("@", 1)
 
-        # Parse host:port
+        query = ""
+        if "?" in hostport:
+            hostport, query = hostport.split("?", 1)
+        hostport = hostport.rstrip("/")
+
         if ":" in hostport:
-            host, port_str = hostport.rsplit(":", 1)
-            port = int(port_str)
+            host, port = hostport.rsplit(":", 1)
+            port = int(port)
         else:
             host, port = hostport, 443
 
-        # Parse query params
-        if "?" in host:
-            host, query = host.split("?", 1)
-            params = urllib.parse.parse_qs(query)
-        else:
-            params = {}
-
-        net = params.get("type", ["tcp"])[0]
-        tls = params.get("security", [""])[0]
-        path = urllib.parse.unquote(params.get("path", ["/"])[0])
-        host_header = urllib.parse.unquote(params.get("host", [""])[0])
-        sni = urllib.parse.unquote(params.get("sni", [""])[0])
-
+        params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()} if query else {}
         return {
-            "v": "2",
-            "ps": remark,
+            "proto": "vless",
+            "id": urllib.parse.unquote(uuid),
             "add": host,
-            "port": str(port),
-            "id": uuid,
-            "aid": "0",
-            "scy": "auto",
-            "net": net,
-            "type": "none",
-            "host": host_header,
-            "path": path,
-            "tls": tls,
-            "sni": sni,
+            "port": port,
+            "net": params.get("type", "tcp"),
+            "tls": params.get("security", "none"),
+            "sni": params.get("sni", ""),
+            "host": params.get("host", ""),
+            "path": urllib.parse.unquote(params.get("path", "")),
+            "ps": fragment,
+            "raw": line,
         }
     except Exception as e:
-        logger.debug(f"URI parse failed: {e}")
+        log.debug(f"vless parse fail: {e} | {line[:80]}")
         return None
 
 
-def is_us_by_remark(cfg: dict) -> bool:
-    ps = str(cfg.get("ps", ""))
-    add = str(cfg.get("add", ""))
-    return bool(US_REMARK_PATTERNS.search(ps)) or bool(US_REMARK_PATTERNS.search(add))
+def parse_vmess(line: str) -> Optional[dict]:
+    """Only base64-JSON form matters for US filter; URI form is legacy."""
+    try:
+        payload = line[8:]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode(payload).decode("utf-8")
+            cfg = json.loads(decoded)
+        except Exception:
+            return None
+        if not cfg.get("add") or not cfg.get("port"):
+            return None
+        return {
+            "proto": "vmess",
+            "id": cfg.get("id"),
+            "add": cfg.get("add"),
+            "port": int(cfg.get("port")),
+            "net": cfg.get("net", "tcp"),
+            "tls": cfg.get("tls", ""),
+            "sni": cfg.get("sni", ""),
+            "host": cfg.get("host", ""),
+            "path": cfg.get("path", ""),
+            "ps": cfg.get("ps", ""),
+            "raw": line,
+        }
+    except Exception:
+        return None
 
 
-def resolve_host(host: str) -> str | None:
-    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host):
+def parse_line(line: str) -> Optional[dict]:
+    line = line.strip()
+    if line.startswith("vless://"):
+        return parse_vless(line)
+    if line.startswith("vmess://"):
+        return parse_vmess(line)
+    return None
+
+
+# ── Source fetch ──────────────────────────────────────────────────────────
+
+def fetch_source(url: str) -> list[str]:
+    try:
+        r = requests.get(url, timeout=REQ_TIMEOUT)
+        r.raise_for_status()
+        text = r.text
+        if "://" not in text[:200]:
+            try:
+                text = base64.b64decode(text).decode("utf-8")
+            except Exception:
+                pass
+        return [ln.strip() for ln in text.splitlines()
+                if ln.strip().startswith(("vless://", "vmess://"))]
+    except Exception as e:
+        log.error(f"fetch {url}: {e}")
+        return []
+
+
+# ── Geo resolution ────────────────────────────────────────────────────────
+
+def resolve_host(host: str) -> Optional[str]:
+    try:
+        ipaddress.ip_address(host)
         return host
+    except ValueError:
+        pass
     try:
         return socket.gethostbyname(host)
     except socket.gaierror:
         return None
 
 
-def batch_geolocation(ips: list[str]) -> dict[str, str]:
-    if not ips:
-        return {}
-    results = {}
-    for i in range(0, len(ips), 100):
-        batch = ips[i:i+100]
-        try:
-            r = requests.post(
-                "http://ip-api.com/batch?fields=countryCode,query",
-                json=batch,
-                timeout=GEO_TIMEOUT,
-                headers={"Content-Type": "application/json"}
-            )
-            r.raise_for_status()
-            for item in r.json():
-                ip = item.get("query")
-                cc = item.get("countryCode", "").upper()
-                if ip:
-                    results[ip] = cc
-        except Exception as e:
-            logger.warning(f"Geo batch {i//100} failed: {e}")
-    return results
-
-
-def is_valid_cfg(cfg: dict) -> bool:
-    return all(cfg.get(k) for k in ("add", "port", "id", "net"))
-
-
-def fetch_source(url: str) -> list[str]:
-    """Fetch a source and return list of vmess:// lines."""
-    try:
-        r = requests.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        text = r.text
-
-        # Some subscriptions wrap the whole file in base64
-        if not text.strip().startswith("vmess://"):
+def batch_geo(ips: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for i in range(0, len(ips), GEO_BATCH):
+        batch = ips[i:i + GEO_BATCH]
+        for attempt in range(3):
             try:
-                text = base64.b64decode(text).decode("utf-8")
-            except Exception:
-                pass
+                r = requests.post(
+                    "http://ip-api.com/batch?fields=countryCode,query",
+                    json=batch, timeout=20,
+                    headers={"Content-Type": "application/json"})
+                if r.status_code == 429:
+                    log.warning("ip-api rate limit, sleeping")
+                    import time; time.sleep(5)
+                    continue
+                r.raise_for_status()
+                for item in r.json():
+                    out[item["query"]] = item.get("countryCode", "").upper()
+                break
+            except Exception as e:
+                log.warning(f"geo batch {i//GEO_BATCH} attempt {attempt}: {e}")
+                import time; time.sleep(2)
+    return out
 
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("vmess://")]
-        logger.info(f"{url}: {len(lines)} vmess lines")
-        return lines
-    except Exception as e:
-        logger.error(f"Failed to fetch {url}: {e}")
-        return []
+
+# ── Liveness check (TCP only — fast) ──────────────────────────────────────
+
+def tcp_alive(host: str, port: int, timeout: float = TCP_TIMEOUT) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────
 
-def fetch_and_filter_us_proxies() -> str | None:
-    # ── 1. Fetch all sources ───────────────────────────────────────────────
-    all_lines = []
+def main() -> Optional[str]:
+    raw_lines = []
     for url in SOURCES:
-        all_lines.extend(fetch_source(url))
-    logger.info(f"Total vmess lines from all sources: {len(all_lines)}")
+        raw_lines.extend(fetch_source(url))
+    log.info(f"Total raw lines: {len(raw_lines)}")
 
-    # ── 2. Decode & validate ─────────────────────────────────────────────
-    parsed = []
-    for line in all_lines:
-        cfg = decode_vmess(line)
-        if cfg and is_valid_cfg(cfg):
-            parsed.append((line, cfg))
+    parsed = [c for c in (parse_line(l) for l in raw_lines) if c]
+    log.info(f"Parsed: {len(parsed)}")
 
-    logger.info(f"Valid configs: {len(parsed)}")
-
-    # ── 3. Deduplicate by server:port ────────────────────────────────────
+    # dedup by (proto, id, host, port)
     seen = OrderedDict()
-    for line, cfg in parsed:
-        key = f"{cfg['add']}:{cfg['port']}"
-        if key not in seen:
-            seen[key] = (line, cfg)
-    unique = list(seen.values())
-    logger.info(f"Unique server:port combos: {len(unique)}")
+    for c in parsed:
+        key = (c["proto"], c["id"], c["add"], c["port"])
+        seen.setdefault(key, c)
+    configs = list(seen.values())
+    log.info(f"Unique: {len(configs)}")
 
-    # ── 4. Fast-path remark filtering ────────────────────────────────────
-    remark_us = []
-    to_geo_check = []
-    for line, cfg in unique:
-        if is_us_by_remark(cfg):
-            remark_us.append(line)
+    # ── Stage 1: remark-based US ─────────────────────────────────────────
+    by_remark = []
+    candidates = []
+    for c in configs:
+        text = f"{c.get('ps','')} {c.get('add','')}"
+        if US_MARKERS.search(text) and not NEG_MARKERS.search(text):
+            by_remark.append(c)
         else:
-            to_geo_check.append((line, cfg))
+            candidates.append(c)
+    log.info(f"US by remark: {len(by_remark)} | geo candidates: {len(candidates)}")
 
-    logger.info(f"US by remarks: {len(remark_us)} | To geo-check: {len(to_geo_check)}")
-
-    # ── 5. Resolve domains → IPs in parallel ─────────────────────────────
-    host_to_ip = {}
-    hosts_to_resolve = list({cfg["add"] for _, cfg in to_geo_check})
+    # ── Stage 2: geo for non-remark candidates ───────────────────────────
+    # Resolve hosts in parallel
+    hosts = list({c["add"] for c in candidates})
+    host_ip: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        future_to_host = {ex.submit(resolve_host, h): h for h in hosts_to_resolve}
-        for future in as_completed(future_to_host):
-            host = future_to_host[future]
-            ip = future.result()
+        futs = {ex.submit(resolve_host, h): h for h in hosts}
+        for f in as_completed(futs):
+            h = futs[f]
+            ip = f.result()
             if ip:
-                host_to_ip[host] = ip
+                host_ip[h] = ip
 
-    ip_mapped = []
-    unresolved = 0
-    for line, cfg in to_geo_check:
-        ip = host_to_ip.get(cfg["add"])
-        if ip:
-            ip_mapped.append((line, ip))
-        else:
-            unresolved += 1
-    if unresolved:
-        logger.warning(f"Could not resolve {unresolved} hosts")
+    # Collect IPs that aren't Cloudflare lies
+    ips_to_check = []
+    cfg_to_ip = {}
+    for c in candidates:
+        ip = host_ip.get(c["add"])
+        if ip and not is_cloudflare(ip):
+            cfg_to_ip[id(c)] = ip
+            ips_to_check.append(ip)
 
-    # ── 6. Batch IP geolocation ──────────────────────────────────────────
-    unique_ips = list({ip for _, ip in ip_mapped})
-    logger.info(f"Querying geolocation for {len(unique_ips)} unique IPs...")
-    geo_map = batch_geolocation(unique_ips)
+    uniq_ips = list(set(ips_to_check))
+    log.info(f"Geo-checking {len(uniq_ips)} non-CF IPs")
+    geo = batch_geo(uniq_ips)
 
-    geo_us = []
-    for line, ip in ip_mapped:
-        if geo_map.get(ip) == "US":
-            geo_us.append(line)
+    by_geo = [c for c in candidates
+              if cfg_to_ip.get(id(c)) and geo.get(cfg_to_ip[id(c)]) == "US"]
+    log.info(f"US by geo: {len(by_geo)}")
 
-    logger.info(f"US by geolocation: {len(geo_us)}")
+    # ── Stage 3: combine, prioritize, liveness ───────────────────────────
+    combined = list(OrderedDict.fromkeys(
+        c["raw"] for c in (by_remark + by_geo)))
+    log.info(f"Combined candidates: {len(combined)}")
 
-    # ── 7. Combine, dedup, and enforce 20-max limit ──────────────────────
-    # Remark-matched entries get priority (more likely intentionally US)
-    combined = list(OrderedDict.fromkeys(remark_us + geo_us))
-    
-    if not combined:
-        logger.warning("No US proxies found!")
+    # Reconstruct cfg lookup for liveness test
+    raw_to_cfg = {c["raw"]: c for c in (by_remark + by_geo)}
+
+    def check(raw):
+        c = raw_to_cfg[raw]
+        return raw, tcp_alive(c["add"], c["port"])
+
+    alive = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for raw, ok in ex.map(check, combined):
+            if ok:
+                alive.append(raw)
+    log.info(f"Alive after TCP check: {len(alive)}")
+
+    # Fall back to non-alive if we don't have enough
+    final_src = alive if len(alive) >= MAX_RESULTS else combined
+    final = final_src[:MAX_RESULTS]
+
+    if not final:
         return ""
-
-    logger.info(f"Total US proxies before limit: {len(combined)}")
-    
-    final = combined[:MAX_RESULTS]
-    logger.info(f"Final US proxy count (max {MAX_RESULTS}): {len(final)}")
-
-    # ── 8. Encode output ─────────────────────────────────────────────────
-    out_text = "\n".join(final) + "\n"
-    encoded = base64.b64encode(out_text.encode("utf-8")).decode("utf-8")
-    return encoded
+    out = "\n".join(final) + "\n"
+    return base64.b64encode(out.encode()).decode()
 
 
-# ── Run ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
-        result = fetch_and_filter_us_proxies()
-        if result is not None:
-            with open(OUTPUT_FILE, "w") as f:
-                f.write(result)
-            logger.info(f"Saved {OUTPUT_FILE} successfully")
+        r = main()
+        if r is None:
+            log.error("filter returned None")
         else:
-            logger.error("Update failed")
+            with open(OUTPUT_FILE, "w") as f:
+                f.write(r)
+            log.info(f"Wrote {OUTPUT_FILE} ({len(r)} b64 chars)")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        log.exception(f"fatal: {e}")
