@@ -2,10 +2,9 @@ name: DailyUpdate
 
 on:
   schedule:
-    - cron: '0 */4 * * *'     # every 4 hours
+    - cron: '0 */4 * * *'
   workflow_dispatch:
 
-# Prevent two runs from racing on the push
 concurrency:
   group: daily-update
   cancel-in-progress: false
@@ -16,29 +15,26 @@ jobs:
     timeout-minutes: 20
 
     permissions:
-      contents: write          # REQUIRED for git push
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0       # full history avoids some push weirdness
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+        run: python -m pip install --upgrade pip requests
 
       - name: Run filter script
         run: python3 update.py
 
-      - name: Show output size
+      - name: Verify output
         run: |
           if [ -f sub.txt ]; then
             echo "sub.txt size: $(wc -c < sub.txt) bytes"
@@ -56,15 +52,6 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "Auto-update: $(date -u +%FT%TZ)"
+            git pull --rebase origin main
             git push
           fi
-
-      - name: Upload artifact on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-output
-          path: |
-            sub.txt
-            *.log
-          if-no-files-found: ignore
