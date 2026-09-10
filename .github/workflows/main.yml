@@ -2,56 +2,54 @@ name: DailyUpdate
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 concurrency:
   group: daily-update
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     permissions:
       contents: write
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
 
       - name: Run filter script
         run: python3 update.py
 
-      - name: Verify output
+      - name: Verify sub.txt Generation
         run: |
-          if [ -f sub.txt ]; then
-            echo "sub.txt size: $(wc -c < sub.txt) bytes"
+          if [ -s sub.txt ]; then
+            echo "sub.txt generated successfully ($(wc -c < sub.txt) bytes)"
           else
-            echo "::error::sub.txt was not created"; exit 1
+            echo "::error::sub.txt is missing or empty"
+            exit 1
           fi
 
-      - name: Commit and push
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add sub.txt
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Auto-update: $(date -u +%FT%TZ)"
-            git pull --rebase origin main
-            git push
-          fi
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto-update: ${{ env.BUILD_TIME }}"
+          file_pattern: 'sub.txt'
+          commit_user_name: 'github-actions[bot]'
+          commit_user_email: '41898282+github-actions[bot]@users.noreply.github.com'
